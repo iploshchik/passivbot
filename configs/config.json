@@ -3,12 +3,12 @@
     "base_dir": "backtests",
     "combine_ohlcvs": true,
     "compress_cache": true,
-    "end_date": "now",
+    "end_date": "2025-01-15",
     "exchanges": [
       "bybit"
     ],
     "gap_tolerance_ohlcvs_minutes": 120.0,
-    "start_date": "2022-01-01",
+    "start_date": "2024-01-01",
     "starting_balance": 10000
   },
   "bot": {
