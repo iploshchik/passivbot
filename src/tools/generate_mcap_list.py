@@ -3,7 +3,6 @@ import json
 import argparse
 import sys
 import os
-from datetime import datetime
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from pure_funcs import calc_hash, symbol_to_coin, ts_to_date_utc
