@@ -3,6 +3,7 @@ import json
 import argparse
 import sys
 import os
+from datetime import datetime
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from pure_funcs import calc_hash, symbol_to_coin, ts_to_date_utc
@@ -10,7 +11,7 @@ from procedures import utc_ms
 
 
 def is_stablecoin(elm):
-    if elm["symbol"] in ["tether", "usdb", "usdy", "tusd", "usd0", "usde"]:
+    if elm["symbol"] in ["tether", "usdb", "usdy", "tusd", "usd0", "usde", 'ubtc']:
         return True
     if (
         all([abs(elm[k] - 1.0) < 0.01 for k in ["high_24h", "low_24h", "current_price"]])
@@ -20,7 +21,7 @@ def is_stablecoin(elm):
     return False
 
 
-def get_top_market_caps(n_coins, minimum_market_cap_millions, exchange=None):
+def get_top_market_caps(n_coins, minimum_market_cap_millions, exchange=None, max_price=None):
     # Fetch the top N coins by market cap
     markets_url = "https://api.coingecko.com/api/v3/coins/markets"
     per_page = 150
@@ -88,6 +89,7 @@ def get_top_market_caps(n_coins, minimum_market_cap_millions, exchange=None):
             elm["liquidity_ratio"] = elm["total_volume"] / elm["market_cap"]
 
             coin = elm["symbol"].upper()
+            print(f'working on {coin}')
             if len(approved_coins) >= n_coins:
                 print(f"N coins == {n_coins}")
                 if added:
@@ -100,6 +102,9 @@ def get_top_market_caps(n_coins, minimum_market_cap_millions, exchange=None):
                 return approved_coins
             if is_stablecoin(elm):
                 disapproved[coin] = "stablecoin"
+                continue
+            if max_price is not None and elm["current_price"] > max_price:
+                disapproved[coin] = f"price_above_{max_price}"
                 continue
             if exchange_approved_coins is not None and coin not in exchange_approved_coins:
                 disapproved[coin] = "not_active"
@@ -127,7 +132,7 @@ if __name__ == "__main__":
         type=int,
         dest="n_coins",
         required=False,
-        default=100,
+        default=50,
         help=f"Maxiumum number of top market cap coins. Default=100",
     )
     parser.add_argument(
@@ -145,7 +150,7 @@ if __name__ == "__main__":
         type=str,
         dest="exchange",
         required=False,
-        default=None,
+        default='bybit',
         help=f"Optional: filter by coins available on exchange. Comma separated values. Default=None",
     )
     parser.add_argument(
@@ -157,15 +162,40 @@ if __name__ == "__main__":
         default=None,
         help="Optional: Output path. Default=configs/approved_coins_{n_coins}_{min_mcap}.json",
     )
+    parser.add_argument(
+        f"--max_price",
+        f"-p",
+        type=float,
+        dest="max_price",
+        required=False,
+        default=5,
+        help="Optional: Skip coins with price above this value. Example: --max_price 5.0",
+    )
+
     args = parser.parse_args()
 
-    market_caps = get_top_market_caps(args.n_coins, args.minimum_market_cap_millions, args.exchange)
+    market_caps = get_top_market_caps(
+        args.n_coins,
+        args.minimum_market_cap_millions,
+        args.exchange,
+        args.max_price)
+
+    # Get absolute path to ../configs/
+    config_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "configs"))
+
     if args.output is None:
-        fname = f"configs/approved_coins_{ts_to_date_utc(utc_ms())[:10]}"
-        fname += f"_{args.n_coins}_coins_{int(args.minimum_market_cap_millions)}_min_mcap"
-        if args.exchange is not None:
-            fname += "_" + "_".join(args.exchange.split(","))
-        fname += ".json"
+        name_parts = [f"top_{args.n_coins}_coins"]
+
+        if args.minimum_market_cap_millions:
+            name_parts.append(f"{int(args.minimum_market_cap_millions)}_mcap")
+
+        if args.max_price is not None:
+            name_parts.append(f"{int(args.max_price)}_usd")
+
+        if args.exchange:
+            name_parts.append(args.exchange.lower())
+
+        fname = os.path.join(config_dir, f"{'_'.join(name_parts)}.json")
     else:
         fname = args.output
     print(f"Dumping output to {fname}")
