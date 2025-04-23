@@ -131,7 +131,7 @@ if __name__ == "__main__":
         type=int,
         dest="n_coins",
         required=False,
-        default=50,
+        default=15,
         help=f"Maxiumum number of top market cap coins. Default=100",
     )
     parser.add_argument(

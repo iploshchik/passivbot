@@ -224,7 +224,7 @@ class BitgetBot(Passivbot):
             if all_data[-1]["timestamp"] < start_time:
                 # print("debug b")
                 break
-            print(f"debug c fetched pnls {len(data)} {all_data[-1]['datetime']}")
+            # print(f"debug c fetched pnls {len(data)} {all_data[-1]['datetime']}")
             params["endTime"] = int(all_data[-1]["timestamp"])
         all_data_d = {calc_hash(x): x for x in all_data}  # deduplicate
         return sorted(all_data_d.values(), key=lambda x: x["timestamp"])
