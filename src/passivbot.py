@@ -1349,6 +1349,7 @@ class Passivbot:
                         self.live_configs[symbol][pside]["entry_grid_spacing_pct"],
                         self.live_configs[symbol][pside]["entry_initial_ema_dist"],
                         self.live_configs[symbol][pside]["entry_initial_qty_pct"],
+                        self.live_configs[symbol][pside]["entry_trailing_double_down_factor"],
                         self.live_configs[symbol][pside]["entry_trailing_grid_ratio"],
                         self.live_configs[symbol][pside]["entry_trailing_retracement_pct"],
                         self.live_configs[symbol][pside]["entry_trailing_threshold_pct"],
@@ -2284,6 +2285,10 @@ def setup_bot(config):
         from exchanges.gateio import GateIOBot
 
         bot = GateIOBot(config)
+    elif user_info["exchange"] == "defx":
+        from exchanges.defx import DefxBot
+
+        bot = DefxBot(config)
     else:
         raise Exception(f"unknown exchange {user_info['exchange']}")
     return bot
