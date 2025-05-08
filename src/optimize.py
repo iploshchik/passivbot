@@ -8,6 +8,7 @@ import multiprocessing
 import mmap
 from multiprocessing import Queue, Process
 from collections import defaultdict
+from contextlib import nullcontext
 from backtest import (
     prepare_hlcvs_mss,
     prep_backtest_args,
@@ -49,116 +50,122 @@ import math
 import fcntl
 from tqdm import tqdm
 from optimizer_overrides import optimizer_overrides
-from opt_utils import make_json_serializable, dominates, generate_incremental_diff, round_floats
+from opt_utils import make_json_serializable, generate_incremental_diff, round_floats
 from pareto_store import ParetoStore
 import msgpack
+from typing import Sequence, Tuple, List
+
+logging.basicConfig(
+    format="%(asctime)s %(processName)-12s %(levelname)-8s %(message)s",
+    level=logging.INFO,
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+
+# === bounds helpers =========================================================
+
+Bound = Tuple[float, float]
 
 
-def is_dominated(candidate, others):
-    for other in others:
-        if all(o <= c for o, c in zip(other, candidate)) and any(
-            o < c for o, c in zip(other, candidate)
-        ):
-            return True
-    return False
+def enforce_bounds(values: Sequence[float], bounds: Sequence[Bound]) -> List[float]:
+    """
+    Clamp each value to its corresponding [low, high] interval.
+
+    Args:
+        values : iterable of floats (length == len(bounds))
+        bounds : iterable of (low, high) pairs
+
+    Returns
+        List[float]  – clamped copy (original is *not* modified)
+    """
+    assert len(values) == len(bounds), "values/bounds length mismatch"
+    return [high if v > high else low if v < low else v for v, (low, high) in zip(values, bounds)]
 
 
-def results_writer_process(queue, results_dir, store, compress=True):
-    import time
-    import logging
-    import json
-    from opt_utils import make_json_serializable, dominates
-    import os
+# ============================================================================
 
-    prev_data = None
+
+def results_writer_process(
+    queue,
+    results_dir,
+    sig_digits,
+    flush_interval,
+    *,
+    compress: bool = True,
+    write_all_results: bool = True,
+):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(processName)-12s %(levelname)-8s %(message)s",
+    )
+    log = logging.getLogger("optimizer.pareto")
+    store = ParetoStore(
+        directory=results_dir,
+        sig_digits=sig_digits,
+        flush_interval=flush_interval,
+        log_name="optimizer.pareto",
+    )
+
     pareto_front = []
     objectives_dict = {}
     index_to_entry = {}
     iteration = 0
-    counter = 0
     n_objectives = None
     scoring_keys = None
 
     results_filename = os.path.join(results_dir, "all_results.bin")
 
     try:
-        with open(results_filename, "ab") as f:
-            packer = msgpack.Packer(use_bin_type=True)
+        with open(results_filename, "ab") if write_all_results else nullcontext() as f:
+            packer = msgpack.Packer(use_bin_type=True) if write_all_results else None
+            prev_data = None
+            counter = 0
             while True:
                 data = queue.get()
                 if data == "DONE":
+                    store.flush_now()
                     break
-                try:
-                    # Write raw results (diffed if compress enabled)
-                    if compress:
-                        if prev_data is None or counter % 100 == 0:
-                            output_data = make_json_serializable(data)
+                if write_all_results:
+                    try:
+                        # Write raw results (diffed if compress enabled)
+                        if compress:
+                            if prev_data is None or counter % 100 == 0:
+                                output_data = make_json_serializable(data)
+                            else:
+                                diff = generate_incremental_diff(prev_data, data)
+                                output_data = make_json_serializable(diff)
+                            counter += 1
+                            prev_data = data
                         else:
-                            diff = generate_incremental_diff(prev_data, data)
-                            output_data = make_json_serializable(diff)
-                        counter += 1
-                        prev_data = data
-                    else:
-                        output_data = data
+                            output_data = data
 
-                    if scoring_keys is None:
-                        scoring_keys = data["optimize"]["scoring"]
-                        n_objectives = len(scoring_keys)
+                        if scoring_keys is None:
+                            scoring_keys = data["optimize"]["scoring"]
+                            n_objectives = len(scoring_keys)
 
-                    # --- Write to all_results.bin ---
-                    f.write(packer.pack(output_data))
-                    f.flush()
-
-                    # --- Pareto front update ---
-                    if "analyses_combined" not in data:
-                        continue
-                    keys = [k for k in data["analyses_combined"] if k.startswith("w_")]
-                    scores = [data["analyses_combined"].get(k) for k in sorted(keys)]
-                    if any(s is None or not isinstance(s, (float, int)) for s in scores):
-                        continue
-                    scores = tuple(float(s) for s in scores)
-                    iteration += 1
-                    index = iteration
-                    objectives_dict[index] = scores
-                    index_to_entry[index] = data
-                    if any(dominates(objectives_dict[idx], scores) for idx in pareto_front):
-                        continue
-                    # Remove dominated entries
-                    dominated = [
-                        idx for idx in pareto_front if dominates(scores, objectives_dict[idx])
-                    ]
-                    for idx in dominated:
-                        old_entry = index_to_entry[idx]
-                        store.remove_entry(
-                            store.hash_entry(round_floats(old_entry, sig_digits=store.sig_digits))
-                        )
-
-                    pareto_front = [
-                        idx for idx in pareto_front if not dominates(scores, objectives_dict[idx])
-                    ]
-                    pareto_front.append(index)
+                        # --- Write to all_results.bin ---
+                        f.write(packer.pack(output_data))
+                        f.flush()
+                    except Exception as e:
+                        logging.error(f"Error writing results: {e}")
+                try:
                     store.add_entry(data)
-
-                    min_str = ", ".join(
-                        f"{min(objectives_dict[idx][i] for idx in pareto_front):.5f}"
-                        for i in range(n_objectives)
-                    )
-                    max_str = ", ".join(
-                        f"{max(objectives_dict[idx][i] for idx in pareto_front):.5f}"
-                        for i in range(n_objectives)
-                    )
-                    line = "(min,max): "
-                    for i, sk in enumerate(scoring_keys):
-                        line += f"{sk}: ({pbr.round_dynamic(min(objectives_dict[idx][i] for idx in pareto_front), 3)}"
-                        line += f",{pbr.round_dynamic(max(objectives_dict[idx][i] for idx in pareto_front), 3)})"
-                        if i < n_objectives - 1:
-                            line += " | "
-                    logging.info(f"Upd PF | Iter: {iteration} | n memb: {len(pareto_front)} | {line}")
                 except Exception as e:
-                    logging.error(f"Error writing results: {e}")
+                    logging.error(f"ParetoStore error: {e}")
 
     except Exception as e:
         logging.error(f"Results writer process error: {e}")
+    finally:
+        # ------------------------------------------------------------------
+        # Make *absolutely* sure the Pareto directory has fresh distance
+        # prefixes before we quit (even after Ctrl-C or an uncaught error).
+        # ------------------------------------------------------------------
+        try:
+            store.flush_interval = 0.0
+            store.flush_now()
+            logging.info("Final Pareto-front update completed.")
+        except Exception as e1:
+            logging.error(f"Unable to flush Pareto front on shutdown: {e1}")
+            traceback.print_exc()
 
 
 def create_shared_memory_file(hlcvs):
@@ -321,9 +328,7 @@ def config_to_individual(config, param_bounds):
             if k not in keys_ignored
         ]
     # adjust to bounds
-    bounds = [(low, high) for low, high in param_bounds.values()]
-    adjusted = [max(min(x, bounds[z][1]), bounds[z][0]) for z, x in enumerate(individual)]
-    return adjusted
+    return enforce_bounds(individual, [(lo, hi) for lo, hi in param_bounds.values()])
 
 
 @contextmanager
@@ -347,30 +352,6 @@ def validate_array(arr, name):
         raise ValueError(f"{name} contains NaN values")
     if np.any(np.isinf(arr)):
         raise ValueError(f"{name} contains inf values")
-
-
-def perturb_individual(individual, bounds, sig_digits):
-    perturbed = []
-    for i, val in enumerate(individual):
-        low, high = bounds[i]
-        if high == low:
-            perturbed.append(val)
-            continue
-
-        # Compute rounding step size based on sig digits
-        step_size = (
-            abs(val) * 10 ** -(sig_digits - 1)
-            if val != 0.0
-            else (high - low) * 10 ** -(sig_digits - 1)
-        )
-        step = step_size * np.random.choice([1.0, -1.0, 0.0])
-
-        new_val = val + step
-        new_val = pbr.round_dynamic(new_val, sig_digits)
-        new_val = min(max(new_val, low), high)
-
-        perturbed.append(new_val)
-    return perturbed
 
 
 class Evaluator:
@@ -424,9 +405,17 @@ class Evaluator:
         self.sig_digits = config.get("optimize", {}).get("round_to_n_significant_digits", 6)
         self.scoring_weights = {
             "adg": -1.0,
+            "adg_per_exposure_long": -1.0,
+            "adg_per_exposure_short": -1.0,
             "adg_w": -1.0,
+            "adg_w_per_exposure_long": -1.0,
+            "adg_w_per_exposure_short": -1.0,
             "btc_adg": -1.0,
+            "btc_adg_per_exposure_long": -1.0,
+            "btc_adg_per_exposure_short": -1.0,
             "btc_adg_w": -1.0,
+            "btc_adg_w_per_exposure_long": -1.0,
+            "btc_adg_w_per_exposure_short": -1.0,
             "btc_calmar_ratio": -1.0,
             "btc_calmar_ratio_w": -1.0,
             "btc_drawdown_worst": 1.0,
@@ -443,10 +432,16 @@ class Evaluator:
             "btc_exponential_fit_error": 1.0,
             "btc_exponential_fit_error_w": 1.0,
             "btc_gain": -1.0,
+            "btc_gain_per_exposure_long": -1.0,
+            "btc_gain_per_exposure_short": -1.0,
             "btc_loss_profit_ratio": 1.0,
             "btc_loss_profit_ratio_w": 1.0,
             "btc_mdg": -1.0,
+            "btc_mdg_per_exposure_long": -1.0,
+            "btc_mdg_per_exposure_short": -1.0,
             "btc_mdg_w": -1.0,
+            "btc_mdg_w_per_exposure_long": -1.0,
+            "btc_mdg_w_per_exposure_short": -1.0,
             "btc_omega_ratio": -1.0,
             "btc_omega_ratio_w": -1.0,
             "btc_sharpe_ratio": -1.0,
@@ -471,10 +466,16 @@ class Evaluator:
             "exponential_fit_error": 1.0,
             "exponential_fit_error_w": 1.0,
             "gain": -1.0,
+            "gain_per_exposure_long": -1.0,
+            "gain_per_exposure_short": -1.0,
             "loss_profit_ratio": 1.0,
             "loss_profit_ratio_w": 1.0,
             "mdg": -1.0,
+            "mdg_per_exposure_long": -1.0,
+            "mdg_per_exposure_short": -1.0,
             "mdg_w": -1.0,
+            "mdg_w_per_exposure_long": -1.0,
+            "mdg_w_per_exposure_short": -1.0,
             "omega_ratio": -1.0,
             "omega_ratio_w": -1.0,
             "position_held_hours_max": 1.0,
@@ -489,6 +490,7 @@ class Evaluator:
             "sterling_ratio": -1.0,
             "sterling_ratio_w": -1.0,
         }
+
         self.build_limit_checks()
 
     def perturb_step_digits(self, individual, change_chance=0.5):
@@ -510,10 +512,9 @@ class Evaluator:
 
             direction = np.random.choice([-1.0, 1.0])
             new_val = pbr.round_dynamic(val + step * direction, self.sig_digits)
-            new_val = min(max(new_val, low), high)
             perturbed.append(new_val)
 
-        return perturbed
+        return enforce_bounds(perturbed, self.param_bounds_expanded)
 
     def perturb_x_pct(self, individual, magnitude=0.01):
         perturbed = []
@@ -522,10 +523,11 @@ class Evaluator:
             if high == low:
                 perturbed.append(val)
                 continue
-            new_val = val * (1 + np.random.uniform(-magnitude, magnitude))
-            new_val = min(max(pbr.round_dynamic(new_val, self.sig_digits), low), high)
+            new_val = pbr.round_dynamic(
+                val * (1 + np.random.uniform(-magnitude, magnitude)), self.sig_digits
+            )
             perturbed.append(new_val)
-        return perturbed
+        return enforce_bounds(perturbed, self.param_bounds_expanded)
 
     def perturb_random_subset(self, individual, frac=0.2):
         perturbed = individual.copy()
@@ -537,8 +539,8 @@ class Evaluator:
                 delta = (high - low) * 0.01
                 step = delta * np.random.uniform(-1.0, 1.0)
                 val = individual[i] + step
-                perturbed[i] = pbr.round_dynamic(np.clip(val, low, high), self.sig_digits)
-        return perturbed
+                perturbed[i] = pbr.round_dynamic(val, self.sig_digits)
+        return enforce_bounds(perturbed, self.param_bounds_expanded)
 
     def perturb_sample_some(self, individual, frac=0.2):
         perturbed = individual.copy()
@@ -548,7 +550,7 @@ class Evaluator:
             low, high = self.param_bounds_expanded[i]
             if low != high:
                 perturbed[i] = pbr.round_dynamic(np.random.uniform(low, high), self.sig_digits)
-        return perturbed
+        return enforce_bounds(perturbed, self.param_bounds_expanded)
 
     def perturb_gaussian(self, individual, scale=0.01):
         perturbed = []
@@ -561,7 +563,7 @@ class Evaluator:
             new_val = pbr.round_dynamic(val + noise, self.sig_digits)
             new_val = min(max(new_val, low), high)
             perturbed.append(new_val)
-        return perturbed
+        return enforce_bounds(perturbed, self.param_bounds_expanded)
 
     def perturb_large_uniform(self, individual):
         perturbed = []
@@ -571,11 +573,14 @@ class Evaluator:
                 perturbed.append(low)
             else:
                 perturbed.append(pbr.round_dynamic(np.random.uniform(low, high), self.sig_digits))
-        return perturbed
+        return enforce_bounds(perturbed, self.param_bounds_expanded)
 
     def evaluate(self, individual, overrides_list):
         if self.sig_digits > 0:
-            individual[:] = [pbr.round_dynamic(v, self.sig_digits) for v in individual]
+            individual[:] = enforce_bounds(
+                [pbr.round_dynamic(v, self.sig_digits) for v in individual],
+                self.param_bounds_expanded,
+            )
         config = individual_to_config(
             individual, optimizer_overrides, overrides_list, template=self.config
         )
@@ -594,8 +599,7 @@ class Evaluator:
             ]
             for perturb_fn in perturbation_funcs:
                 perturbed = round_floats(perturb_fn(individual), self.sig_digits)
-                # changed = [(x, y) for x, y in zip(individual, perturbed) if x != y]
-                # print("debug c", changed)
+                perturbed = enforce_bounds(perturbed, self.param_bounds_expanded)
                 new_hash = calc_hash(perturbed)
                 if new_hash not in self.seen_hashes:
                     logging.info(
@@ -842,11 +846,6 @@ async def main():
     add_arguments_recursively(parser, template_config)
     add_extra_options(parser)
     args = parser.parse_args()
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        level=logging.INFO,
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
     if args.config_path is None:
         logging.info(f"loading default template config configs/template.json")
         config = load_config("configs/template.json", verbose=True)
@@ -966,11 +965,15 @@ async def main():
         seen_hashes = manager.dict()
         duplicate_counter = manager.dict()
         duplicate_counter["count"] = 0
-        store = ParetoStore(results_dir)
-        writer_process = Process(
+        flush_interval = 60  # or read from your config
+        sig_digits = config["optimize"]["round_to_n_significant_digits"]
+        writer_process = multiprocessing.Process(
             target=results_writer_process,
-            args=(results_queue, results_dir, store),
-            kwargs={"compress": config["optimize"]["compress_results_file"]},
+            args=(results_queue, results_dir, sig_digits, flush_interval),
+            kwargs={
+                "compress": config["optimize"]["compress_results_file"],
+                "write_all_results": config["optimize"].get("write_all_results", True),  # ← new
+            },
         )
         writer_process.start()
 
@@ -1072,10 +1075,7 @@ async def main():
         if starting_individuals:
             bounds = [(low, high) for low, high in param_bounds.values()]
             for i in range(len(starting_individuals)):
-                adjusted = [
-                    max(min(x, bounds[z][1]), bounds[z][0])
-                    for z, x in enumerate(starting_individuals[i])
-                ]
+                adjusted = enforce_bounds(starting_individuals[i], bounds)
                 population[i] = creator.Individual(adjusted)
 
             # populate up to half of the population with duplicates of random choices within starting configs
@@ -1133,18 +1133,6 @@ async def main():
             pool.close()
             pool.terminate()
             pool.join()
-
-        # ------------------------------------------------------------------
-        # Make *absolutely* sure the Pareto directory has fresh distance
-        # prefixes before we quit (even after Ctrl-C or an uncaught error).
-        # ------------------------------------------------------------------
-        try:
-            store.update_interval = 0.0
-            store.flush_updates()
-            logging.info("Final Pareto-front update completed.")
-        except Exception as e:
-            logging.error(f"Unable to flush Pareto front on shutdown: {e}")
-            traceback.print_exc()
 
         # Remove shared memory files (including BTC/USD)
         if "shared_memory_files" in locals():

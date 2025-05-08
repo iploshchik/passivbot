@@ -987,7 +987,7 @@ impl<'a> Backtest<'a> {
         // check if coin is delisted; if so, close pos as unstuck close
         if let Some(&delist_timestamp) = self.last_valid_timestamps.get(&idx) {
             if k >= delist_timestamp && self.positions.long.contains_key(&idx) {
-                self.open_orders.long.get_mut(&idx).unwrap().closes = [Order {
+                self.open_orders.long.entry(idx).or_default().closes = vec![Order {
                     qty: -self.positions.long[&idx].size,
                     price: round_(
                         f64::min(
@@ -997,9 +997,13 @@ impl<'a> Backtest<'a> {
                         self.exchange_params_list[idx].price_step,
                     ),
                     order_type: OrderType::CloseUnstuckLong,
-                }]
-                .to_vec();
-                self.open_orders.long.entry(idx).or_default().entries = Vec::new();
+                }];
+                self.open_orders
+                    .long
+                    .entry(idx)
+                    .or_default()
+                    .entries
+                    .clear();
                 return;
             }
         }
@@ -1059,7 +1063,7 @@ impl<'a> Backtest<'a> {
         // check if coin is delisted; if so, close pos as unstuck close
         if let Some(&delist_timestamp) = self.last_valid_timestamps.get(&idx) {
             if k >= delist_timestamp && self.positions.short.contains_key(&idx) {
-                self.open_orders.short.get_mut(&idx).unwrap().closes = [Order {
+                self.open_orders.short.entry(idx).or_default().closes = vec![Order {
                     qty: self.positions.short[&idx].size.abs(),
                     price: round_(
                         f64::max(
@@ -1068,10 +1072,14 @@ impl<'a> Backtest<'a> {
                         ),
                         self.exchange_params_list[idx].price_step,
                     ),
-                    order_type: OrderType::CloseUnstuckLong,
-                }]
-                .to_vec();
-                self.open_orders.short.entry(idx).or_default().entries = Vec::new();
+                    order_type: OrderType::CloseUnstuckShort,
+                }];
+                self.open_orders
+                    .short
+                    .entry(idx)
+                    .or_default()
+                    .entries
+                    .clear();
                 return;
             }
         }
@@ -1403,18 +1411,18 @@ impl<'a> Backtest<'a> {
                 LONG => {
                     self.open_orders
                         .long
-                        .get_mut(&unstucking_idx)
-                        .unwrap()
-                        .closes = [unstucking_close].to_vec();
+                        .entry(unstucking_idx)
+                        .or_default()
+                        .closes = vec![unstucking_close];
                 }
                 SHORT => {
                     self.open_orders
                         .short
-                        .get_mut(&unstucking_idx)
-                        .unwrap()
-                        .closes = [unstucking_close].to_vec();
+                        .entry(unstucking_idx)
+                        .or_default()
+                        .closes = vec![unstucking_close];
                 }
-                _ => panic!("Invalid unstucking_pside"),
+                _ => unreachable!(),
             }
         }
     }
@@ -1944,6 +1952,8 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
     let equity_jerkiness = calc_equity_jerkiness(&daily_eqs);
     let exponential_fit_error = calc_exponential_fit_error(&daily_eqs);
 
+    let volume_pct_per_day_avg = calc_avg_volume_pct_per_day(fills);
+
     let mut analysis = Analysis::default();
     analysis.adg = adg;
     analysis.mdg = mdg;
@@ -1969,6 +1979,7 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
     analysis.equity_choppiness = equity_choppiness;
     analysis.equity_jerkiness = equity_jerkiness;
     analysis.exponential_fit_error = exponential_fit_error;
+    analysis.volume_pct_per_day_avg = volume_pct_per_day_avg;
 
     analysis
 }
@@ -2047,7 +2058,11 @@ pub fn analyze_backtest(fills: &[Fill], equities: &Vec<f64>) -> Analysis {
         .map(|a| a.exponential_fit_error)
         .sum::<f64>()
         / 10.0;
-
+    analysis.volume_pct_per_day_avg_w = subset_analyses
+        .iter()
+        .map(|a| a.volume_pct_per_day_avg)
+        .sum::<f64>()
+        / 10.0;
     analysis
 }
 
@@ -2184,4 +2199,29 @@ pub fn smoothed_terminal_geometric_gain_and_adg(daily_eqs: &[f64]) -> (f64, f64)
     let n_days = daily_eqs.len() as f64;
     let gain = end / start;
     (gain, gain.powf(1.0 / n_days) - 1.0)
+}
+
+/// Calculates average volume per day as a percentage of balance.
+/// For each fill: abs(qty) * price / balance_at_fill
+pub fn calc_avg_volume_pct_per_day(fills: &[Fill]) -> f64 {
+    if fills.is_empty() {
+        return 0.0;
+    }
+
+    // Use a HashMap to sum cost_pct per day
+    use std::collections::HashMap;
+    let mut daily_totals: HashMap<usize, f64> = HashMap::new();
+
+    for fill in fills {
+        let day = fill.index / 1440;
+        let cost_pct = (fill.fill_qty.abs() * fill.fill_price) / fill.balance_usd_total;
+        *daily_totals.entry(day).or_insert(0.0) += cost_pct;
+    }
+
+    let total_days = daily_totals.len() as f64;
+    if total_days == 0.0 {
+        0.0
+    } else {
+        daily_totals.values().sum::<f64>() / total_days
+    }
 }
